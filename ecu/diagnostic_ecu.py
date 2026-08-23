@@ -2,16 +2,10 @@ import can
 import time
 from datetime import datetime
 
-
-# ---------------------------------------------------------
-# DIAGNOSTIC ECU
-# ---------------------------------------------------------
-
 bus = can.Bus(
     interface="socketcan",
     channel="vcan0"
 )
-
 
 print("==============================================")
 print("          DIAGNOSTIC ECU STARTED")
@@ -19,92 +13,124 @@ print("==============================================")
 print("Monitoring CAN network...\n")
 
 
-# ---------------------------------------------------------
-# Last received message times
-# ---------------------------------------------------------
+# =========================================================
+# Last message timestamps
+# =========================================================
 
-last_sensor_message = 0
-last_controller_message = 0
-last_power_message = 0
+last_sensor = 0
+last_controller = 0
+last_power = 0
 
-
-# ---------------------------------------------------------
-# Fault logging
-# ---------------------------------------------------------
-
-fault_log = []
+faults = []
 
 
-def log_fault(fault):
+def log_fault(message):
 
-    timestamp = datetime.now().strftime(
-        "%H:%M:%S"
+    timestamp = datetime.now().strftime("%H:%M:%S")
+
+    entry = f"{timestamp} - {message}"
+
+    if entry not in faults:
+
+        faults.append(entry)
+
+        print("\n" + "!" * 60)
+        print("DIAGNOSTIC FAULT")
+        print("!" * 60)
+        print(f"Timestamp : {timestamp}")
+        print(f"Fault     : {message}")
+        print("!" * 60)
+
+
+def send_diagnostic_status():
+
+    # Fault count
+    fault_count = min(len(faults), 255)
+
+    # Overall status
+    status = 0 if fault_count == 0 else 1
+
+    message = can.Message(
+        arbitration_id=0x400,
+        data=[
+            status,
+            fault_count,
+            1 if last_sensor else 0,
+            1 if last_controller else 0,
+            1 if last_power else 0
+        ],
+        is_extended_id=False
     )
 
-    entry = f"{timestamp} - {fault}"
+    try:
+        bus.send(message)
 
-    fault_log.append(entry)
+    except can.CanError:
+        pass
 
-    print("\n" + "!" * 60)
-
-    print("DIAGNOSTIC FAULT")
-
-    print("!" * 60)
-
-    print(f"Timestamp : {timestamp}")
-    print(f"Fault     : {fault}")
-
-    print("!" * 60 + "\n")
-
-
-# ---------------------------------------------------------
-# Monitor CAN messages
-# ---------------------------------------------------------
 
 while True:
 
     message = bus.recv(timeout=0.1)
 
-    current_time = time.time()
+    now = time.time()
 
-
-    # -----------------------------------------------------
-    # Process received message
-    # -----------------------------------------------------
+    # =====================================================
+    # Process CAN message
+    # =====================================================
 
     if message is not None:
 
-        # -----------------------------------------------
-        # Sensor ECU messages
-        # -----------------------------------------------
+        # -------------------------------------------------
+        # Sensor ECU
+        # -------------------------------------------------
 
-        if message.arbitration_id == 0x100:
+        if message.arbitration_id in [
+            0x100,
+            0x101,
+            0x102,
+            0x103
+        ]:
 
-            last_sensor_message = current_time
+            last_sensor = now
 
+        # -------------------------------------------------
+        # Controller ECU
+        # -------------------------------------------------
 
-        elif message.arbitration_id == 0x101:
+        elif message.arbitration_id in [
+            0x200,
+            0x201,
+            0x202
+        ]:
 
-            last_sensor_message = current_time
+            last_controller = now
 
-            # Decode Cell 4
-            cell4_raw = (
-                (message.data[0] << 8)
-                | message.data[1]
+        # -------------------------------------------------
+        # Power Control ECU
+        # -------------------------------------------------
+
+        elif message.arbitration_id in [
+            0x300,
+            0x301
+        ]:
+
+            last_power = now
+
+        # -------------------------------------------------
+        # Sensor data validation
+        # -------------------------------------------------
+
+        if message.arbitration_id == 0x101:
+
+            cell4 = (
+                ((message.data[0] << 8) | message.data[1])
+                / 100
             )
 
-            cell4 = cell4_raw / 100.0
-
-            # Decode temperature
             temperature = message.data[2] - 40
 
-            # Decode current
             current = message.data[3] - 100
-
-
-            # -------------------------------------------
-            # Sensor validation
-            # -------------------------------------------
 
             if temperature > 60:
 
@@ -113,14 +139,12 @@ while True:
                     f"{temperature} °C"
                 )
 
-
             elif temperature < -10:
 
                 log_fault(
                     f"Battery temperature too low: "
                     f"{temperature} °C"
                 )
-
 
             if cell4 > 4.20:
 
@@ -129,14 +153,12 @@ while True:
                     f"{cell4:.2f} V"
                 )
 
-
             elif cell4 < 3.00:
 
                 log_fault(
                     f"Cell 4 under-voltage: "
                     f"{cell4:.2f} V"
                 )
-
 
             if abs(current) > 50:
 
@@ -145,77 +167,100 @@ while True:
                     f"{current} A"
                 )
 
+        # -------------------------------------------------
+        # Battery pack status
+        # -------------------------------------------------
 
-        # -----------------------------------------------
-        # BMS Controller message
-        # -----------------------------------------------
+        elif message.arbitration_id == 0x102:
 
-        elif message.arbitration_id == 0x200:
+            state = message.data[0]
 
-            last_controller_message = current_time
+            if state == 2:
 
+                log_fault("Battery pack over-temperature")
 
-        # -----------------------------------------------
-        # Power Control ECU heartbeat
-        # -----------------------------------------------
+            elif state == 3:
 
-        elif message.arbitration_id == 0x300:
+                log_fault("Battery pack low temperature")
 
-            last_power_message = current_time
+            elif state == 4:
 
+                log_fault("Battery pack overvoltage")
 
-    # -----------------------------------------------------
-    # Check for ECU timeouts
-    # -----------------------------------------------------
+            elif state == 5:
 
-    # Sensor ECU timeout
+                log_fault("Battery pack undervoltage")
+
+    # =====================================================
+    # ECU timeout detection
+    # =====================================================
+
     if (
-        last_sensor_message != 0
-        and current_time - last_sensor_message > 3
+        last_sensor != 0
+        and now - last_sensor > 3
     ):
 
-        log_fault(
-            "Sensor ECU timeout"
-        )
+        log_fault("Sensor ECU timeout")
 
-        last_sensor_message = current_time
+        last_sensor = now
 
 
-    # Controller ECU timeout
     if (
-        last_controller_message != 0
-        and current_time - last_controller_message > 3
+        last_controller != 0
+        and now - last_controller > 3
     ):
 
-        log_fault(
-            "BMS Controller ECU timeout"
-        )
+        log_fault("BMS Controller ECU timeout")
 
-        last_controller_message = current_time
+        last_controller = now
 
 
-    # Power Control ECU timeout
     if (
-        last_power_message != 0
-        and current_time - last_power_message > 3
+        last_power != 0
+        and now - last_power > 3
     ):
 
-        log_fault(
-            "Power Control ECU timeout"
-        )
+        log_fault("Power Control ECU timeout")
 
-        last_power_message = current_time
+        last_power = now
 
 
-    # -----------------------------------------------------
-    # Display monitoring status
-    # -----------------------------------------------------
+    # =====================================================
+    # Diagnostic status message
+    # =====================================================
+
+    send_diagnostic_status()
+
+
+    # =====================================================
+    # Display
+    # =====================================================
+
+    sensor_status = (
+        "OK"
+        if last_sensor and now - last_sensor < 3
+        else "WAIT"
+    )
+
+    controller_status = (
+        "OK"
+        if last_controller and now - last_controller < 3
+        else "WAIT"
+    )
+
+    power_status = (
+        "OK"
+        if last_power and now - last_power < 3
+        else "WAIT"
+    )
 
     print(
-        f"\rMonitoring CAN network | "
-        f"Sensor: {'OK' if last_sensor_message and current_time-last_sensor_message < 3 else 'WAIT'} | "
-        f"Controller: {'OK' if last_controller_message and current_time-last_controller_message < 3 else 'WAIT'} | "
-        f"Power: {'OK' if last_power_message and current_time-last_power_message < 3 else 'WAIT'}",
+        f"\rSensor: {sensor_status} | "
+        f"Controller: {controller_status} | "
+        f"Power: {power_status} | "
+        f"Faults: {len(faults)}",
         end="",
         flush=True
     )
+
+    time.sleep(0.1)
