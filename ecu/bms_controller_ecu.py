@@ -1,434 +1,259 @@
 import can
 import time
 
-# ---------------------------------------------------------
-# BMS CONTROLLER ECU
-# ---------------------------------------------------------
-# Responsibilities:
-# 1. Receive battery sensor data
-# 2. Decode cell voltages, temperature and current
-# 3. Calculate battery voltage and SOC
-# 4. Check battery safety conditions
-# 5. Send control commands to Power Control ECU
-# ---------------------------------------------------------
-
-
-# Create SocketCAN interface
 bus = can.Bus(
     interface="socketcan",
     channel="vcan0"
 )
 
-
 print("==============================================")
-print("       BMS CONTROLLER ECU STARTED")
+print("         BMS CONTROLLER ECU STARTED")
 print("==============================================")
 print("Waiting for battery sensor data...\n")
-
-
-# ---------------------------------------------------------
-# Latest sensor values
-# ---------------------------------------------------------
 
 cell1 = 0.0
 cell2 = 0.0
 cell3 = 0.0
 cell4 = 0.0
-
 temperature = 0.0
 current = 0.0
+soc = 0.0
+battery_state = 0
 
 
-# ---------------------------------------------------------
-# SOC Calculation
-# ---------------------------------------------------------
-
-def calculate_soc(average_voltage):
-    """
-    Simple educational SOC estimation.
-
-    3.60 V = 0% SOC
-    4.20 V = 100% SOC
-    """
-
-    soc = ((average_voltage - 3.60) / 0.60) * 100
-
-    # Keep SOC between 0 and 100
-    soc = max(0, min(100, soc))
-
-    return soc
-
-
-# ---------------------------------------------------------
-# Send control command to Power Control ECU
-# CAN ID: 0x200
-#
-# Byte 0 = Charge Contactor
-# Byte 1 = Discharge Contactor
-# Byte 2 = Cooling Fan
-# Byte 3 = System Mode
-#
-# Mode:
-# 0 = IDLE
-# 1 = CHARGING
-# 2 = DISCHARGING
-# 3 = SAFE MODE
-# ---------------------------------------------------------
-
-def send_control_command(charge, discharge, cooling, mode):
-
-    message = can.Message(
-        arbitration_id=0x200,
-        data=[
-            charge,
-            discharge,
-            cooling,
-            mode
-        ],
-        is_extended_id=False
-    )
-
+def send_message(can_id, data):
     try:
-
+        message = can.Message(
+            arbitration_id=can_id,
+            data=data,
+            is_extended_id=False
+        )
         bus.send(message)
-
     except can.CanError:
+        print(f"ERROR: Failed to send 0x{can_id:X}")
 
-        print("ERROR: Failed to send control command")
 
+def calculate_soc(avg_voltage):
+    soc = ((avg_voltage - 3.60) / 0.60) * 100
+    return max(0, min(100, soc))
 
-# ---------------------------------------------------------
-# Main Loop
-# ---------------------------------------------------------
 
 while True:
 
-    # Wait for CAN message
     message = bus.recv(timeout=1)
 
-    # -----------------------------------------------------
-    # No CAN message received
-    # -----------------------------------------------------
-
     if message is None:
-
         print("WARNING: No CAN message received")
-
         continue
 
-
     # =====================================================
-    # CAN ID 0x100
-    #
-    # Contains:
-    # Cell 1 voltage
-    # Cell 2 voltage
-    # Cell 3 voltage
+    # 0x100 - Cell 1, 2, 3
     # =====================================================
 
     if message.arbitration_id == 0x100:
 
-        # Decode Cell 1
-        cell1_raw = (
-            (message.data[0] << 8)
-            | message.data[1]
+        cell1 = (
+            ((message.data[0] << 8) | message.data[1])
+            / 100
         )
 
-        cell1 = cell1_raw / 100.0
-
-
-        # Decode Cell 2
-        cell2_raw = (
-            (message.data[2] << 8)
-            | message.data[3]
+        cell2 = (
+            ((message.data[2] << 8) | message.data[3])
+            / 100
         )
 
-        cell2 = cell2_raw / 100.0
-
-
-        # Decode Cell 3
-        cell3_raw = (
-            (message.data[4] << 8)
-            | message.data[5]
+        cell3 = (
+            ((message.data[4] << 8) | message.data[5])
+            / 100
         )
-
-        cell3 = cell3_raw / 100.0
-
 
     # =====================================================
-    # CAN ID 0x101
-    #
-    # Contains:
-    # Cell 4 voltage
-    # Temperature
-    # Current
+    # 0x101 - Cell 4 + Temperature + Current
     # =====================================================
 
     elif message.arbitration_id == 0x101:
 
-        # Decode Cell 4
-        cell4_raw = (
-            (message.data[0] << 8)
-            | message.data[1]
+        cell4 = (
+            ((message.data[0] << 8) | message.data[1])
+            / 100
         )
-
-        cell4 = cell4_raw / 100.0
-
-
-        # Decode temperature
-        #
-        # Sensor ECU:
-        # temperature + 40
-        #
-        # Controller:
-        # received value - 40
 
         temperature = message.data[2] - 40
-
-
-        # Decode current
-        #
-        # Sensor ECU:
-        # current + 100
-        #
-        # Controller:
-        # received value - 100
-
         current = message.data[3] - 100
 
-
-        # =================================================
-        # Calculate battery parameters
-        # =================================================
-
-        total_voltage = (
-            cell1 +
-            cell2 +
-            cell3 +
-            cell4
-        )
-
+        total_voltage = cell1 + cell2 + cell3 + cell4
         average_voltage = total_voltage / 4
 
+        soc = calculate_soc(average_voltage)
 
-        # Calculate SOC
+    # =====================================================
+    # 0x102 - Battery Pack Status
+    # =====================================================
 
-        soc = calculate_soc(
-            average_voltage
+    elif message.arbitration_id == 0x102:
+
+        battery_state = message.data[0]
+
+        soc = message.data[1]
+
+        pack_voltage = (
+            ((message.data[2] << 8) | message.data[3])
+            / 10
         )
 
+    # =====================================================
+    # 0x103 - Sensor Health
+    # =====================================================
 
-        # =================================================
-        # Battery Safety Checks
-        # =================================================
+    elif message.arbitration_id == 0x103:
+
+        sensor_health = message.data[0]
+
+    # =====================================================
+    # Process complete battery data after 0x101
+    # =====================================================
+
+    if message.arbitration_id == 0x101:
+
+        cells = [cell1, cell2, cell3, cell4]
 
         battery_status = "NORMAL"
 
-
-        # Over-temperature
         if temperature > 50:
-
             battery_status = "OVERHEAT"
 
-
-        # Low temperature
         elif temperature < 0:
-
             battery_status = "LOW TEMPERATURE"
 
-
-        # Cell over-voltage
-        elif any(
-            cell > 4.20
-            for cell in [cell1, cell2, cell3, cell4]
-        ):
-
+        elif any(cell > 4.20 for cell in cells):
             battery_status = "OVERVOLTAGE"
 
-
-        # Cell under-voltage
-        elif any(
-            cell < 3.00
-            for cell in [cell1, cell2, cell3, cell4]
-        ):
-
+        elif any(cell < 3.00 for cell in cells):
             battery_status = "UNDERVOLTAGE"
 
-
-        # =================================================
-        # Display Battery Information
-        # =================================================
-
-        print("\n" + "=" * 60)
-
-        print("             BMS BATTERY STATUS")
-
-        print("=" * 60)
-
-
-        print(
-            f"Cell 1 Voltage : {cell1:.2f} V"
-        )
-
-        print(
-            f"Cell 2 Voltage : {cell2:.2f} V"
-        )
-
-        print(
-            f"Cell 3 Voltage : {cell3:.2f} V"
-        )
-
-        print(
-            f"Cell 4 Voltage : {cell4:.2f} V"
-        )
-
-
-        print("-" * 60)
-
-
-        print(
-            f"Battery Voltage : {total_voltage:.2f} V"
-        )
-
-        print(
-            f"Average Voltage : {average_voltage:.2f} V"
-        )
-
-        print(
-            f"Temperature     : {temperature:.1f} °C"
-        )
-
-        print(
-            f"Current         : {current:.1f} A"
-        )
-
-        print(
-            f"Estimated SOC   : {soc:.1f} %"
-        )
-
-        print(
-            f"Battery Status  : {battery_status}"
-        )
-
-
-        # =================================================
-        # Determine Power Control Command
-        # =================================================
+        # -------------------------------------------------
+        # Determine operation
+        # -------------------------------------------------
 
         if battery_status != "NORMAL":
 
-            # ---------------------------------------------
-            # Unsafe battery
-            #
-            # Charging OFF
-            # Discharging OFF
-            # Cooling ON
-            # SAFE MODE
-            # ---------------------------------------------
-
-            send_control_command(
-                charge=0,
-                discharge=0,
-                cooling=1,
-                mode=3
-            )
-
-            print(
-                "Operation       : SAFE MODE"
-            )
-
+            mode = 3
+            charge = 0
+            discharge = 0
+            cooling = 1
 
         elif temperature > 40:
 
-            # ---------------------------------------------
-            # Battery temperature is getting high
-            #
-            # Charging OFF
-            # Discharging OFF
-            # Cooling ON
-            # ---------------------------------------------
-
-            send_control_command(
-                charge=0,
-                discharge=0,
-                cooling=1,
-                mode=3
-            )
-
-            print(
-                "Operation       : COOLING"
-            )
-
+            mode = 3
+            charge = 0
+            discharge = 0
+            cooling = 1
 
         elif current > 0:
 
-            # ---------------------------------------------
-            # Battery charging
-            #
-            # Charging ON
-            # Discharging OFF
-            # Cooling OFF
-            # CHARGING MODE
-            # ---------------------------------------------
-
-            send_control_command(
-                charge=1,
-                discharge=0,
-                cooling=0,
-                mode=1
-            )
-
-            print(
-                "Operation       : CHARGING"
-            )
-
+            mode = 1
+            charge = 1
+            discharge = 0
+            cooling = 0
 
         elif current < 0:
 
-            # ---------------------------------------------
-            # Battery discharging
-            #
-            # Charging OFF
-            # Discharging ON
-            # Cooling OFF
-            # DISCHARGING MODE
-            # ---------------------------------------------
-
-            send_control_command(
-                charge=0,
-                discharge=1,
-                cooling=0,
-                mode=2
-            )
-
-            print(
-                "Operation       : DISCHARGING"
-            )
-
+            mode = 2
+            charge = 0
+            discharge = 1
+            cooling = 0
 
         else:
 
-            # ---------------------------------------------
-            # Battery idle
-            #
-            # Everything OFF
-            # IDLE MODE
-            # ---------------------------------------------
+            mode = 0
+            charge = 0
+            discharge = 0
+            cooling = 0
 
-            send_control_command(
-                charge=0,
-                discharge=0,
-                cooling=0,
-                mode=0
-            )
+        # =================================================
+        # 0x200 - General Power Control Command
+        # =================================================
 
-            print(
-                "Operation       : IDLE"
-            )
+        send_message(
+            0x200,
+            [
+                charge,
+                discharge,
+                cooling,
+                mode
+            ]
+        )
 
+        # =================================================
+        # 0x201 - Charging Command
+        #
+        # Byte 0 = enable/disable
+        # Byte 1 = requested current
+        # =================================================
+
+        charging_current = max(
+            0,
+            min(100, int(abs(current)))
+        )
+
+        send_message(
+            0x201,
+            [
+                charge,
+                charging_current
+            ]
+        )
+
+        # =================================================
+        # 0x202 - Cooling Command
+        #
+        # Byte 0 = fan enable
+        # Byte 1 = temperature
+        # =================================================
+
+        send_message(
+            0x202,
+            [
+                cooling,
+                max(0, min(255, int(temperature + 40)))
+            ]
+        )
+
+        # =================================================
+        # Display
+        # =================================================
+
+        total_voltage = cell1 + cell2 + cell3 + cell4
+
+        print("\n" + "=" * 60)
+        print("             BMS BATTERY STATUS")
+        print("=" * 60)
+
+        print(f"Cell 1 Voltage : {cell1:.2f} V")
+        print(f"Cell 2 Voltage : {cell2:.2f} V")
+        print(f"Cell 3 Voltage : {cell3:.2f} V")
+        print(f"Cell 4 Voltage : {cell4:.2f} V")
+
+        print("-" * 60)
+
+        print(f"Battery Voltage : {total_voltage:.2f} V")
+        print(f"Temperature     : {temperature:.1f} °C")
+        print(f"Current         : {current:.1f} A")
+        print(f"Estimated SOC   : {soc:.1f} %")
+        print(f"Battery Status  : {battery_status}")
+
+        if mode == 1:
+            print("Operation       : CHARGING")
+
+        elif mode == 2:
+            print("Operation       : DISCHARGING")
+
+        elif mode == 3:
+            print("Operation       : SAFE MODE")
+
+        else:
+            print("Operation       : IDLE")
 
         print("=" * 60)
 
-
-        # Small delay
         time.sleep(0.1)
